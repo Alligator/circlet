@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+  <head>
+    <style>body { background: black; color: white }</style>
+    <script>
+const ws = new WebSocket('ws://localhost:8000/ws');
+ws.onmessage = (event) => {
+  document.getElementById('data').innerText += `\n${event.data}`;
+};
+
+window.onload = () => {
+  document.getElementById('btn').addEventListener('click', () => {
+    const msg = document.getElementById('send').value;
+    ws.send(msg);
+  });
+};
+    </script>
+  </head>
+  <body>
+    <h1>janet ws test</h1>
+    <input type="text" id="send">
+    <input type="button" id="btn" value="send">
+    <pre id="data"></pre>
+  </body>
+</html>

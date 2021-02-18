@@ -223,29 +223,161 @@ static void send_http(struct mg_connection *c, Janet res, void *ev_data) {
     c->flags |= MG_F_SEND_AND_CLOSE;
 }
 
+static Janet cfun_ws_client_send(int32_t argc, Janet *argv) {
+    janet_fixarity(argc, 2);
+    JanetTable *self = janet_gettable(argv, 0);
+    Janet buf = argv[1];
+
+    if (!janet_checktype(buf, JANET_STRING) && !janet_checktype(buf, JANET_BUFFER)) {
+        janet_panicf("websocket data must be a string or buffer, got %d", janet_type(buf));
+    }
+
+    const uint8_t *bytes;
+    int32_t len;
+    if (!janet_bytes_view(buf, &bytes, &len)) {
+        janet_panicf("couldnt get buffer view");
+    }
+
+    Janet conn = janet_table_get(self, janet_ckeywordv("connection"));
+    struct mg_connection *nc = (struct mg_connection *)janet_unwrap_pointer(conn);
+
+    char addr[32];
+    mg_sock_addr_to_str(&nc->sa, addr, sizeof(addr),
+                        MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
+    fprintf(stderr, "trying to send '%.*s', len %d, to %s\n", len, bytes, len, addr);
+
+    mg_send_websocket_frame(nc, WEBSOCKET_OP_TEXT, bytes, len);
+    return janet_wrap_nil();
+}
+
+static Janet cfun_get_ws_clients (int32_t argc, Janet *argv) {
+    janet_fixarity(argc, 1);
+    JanetTable *req = janet_gettable(argv, 0);
+    Janet conn = janet_table_get(req, janet_ckeywordv("connection"));
+    struct mg_connection *nc = (struct mg_connection *)janet_unwrap_pointer(conn);
+
+    JanetArray *clients = janet_array(5);
+
+    char self_addr[32];
+    mg_sock_addr_to_str(&nc->sa, self_addr, sizeof(self_addr),
+                        MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
+
+    struct mg_connection *c;
+    for (c = mg_next(nc->mgr, NULL); c != NULL; c = mg_next(nc->mgr, c)) {
+        char addr[32];
+        mg_sock_addr_to_str(&c->sa, addr, sizeof(addr),
+                            MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
+        fprintf(stderr, "get_ws_clients for %s got %s\n", self_addr, addr);
+        if (c == nc) {
+            fprintf(stderr, "  ignoring, same as og\n");
+            continue;
+        }
+        if ((c->flags & MG_F_IS_WEBSOCKET) == 0) {
+            fprintf(stderr, "  ignoring, not websocket\n");
+            continue;
+        }
+
+        JanetTable *client = janet_table(2);
+        janet_table_put(client, janet_ckeywordv("connection"), janet_wrap_pointer(c));
+        janet_table_put(client, janet_ckeywordv("send"), janet_wrap_cfunction(cfun_ws_client_send));
+        janet_array_push(clients, janet_wrap_table(client));
+    }
+
+    return janet_wrap_array(clients);
+}
+
 /* The dispatching event handler. This handler is what
  * is presented to mongoose, but it dispatches to dynamically
  * defined handlers. */
-static void http_handler(struct mg_connection *c, int ev, void *p) {
-    Janet evdata;
+static void ev_handler(struct mg_connection *c, int ev, void *p) {
     switch (ev) {
         default:
             return;
-        case MG_EV_HTTP_REQUEST:
-            evdata = build_http_request(c, (struct http_message *)p);
+        case MG_EV_HTTP_REQUEST: {
+            Janet evdata = build_http_request(c, (struct http_message *)p);
+            ConnectionWrapper *cw;
+            JanetFiber *fiber;
+            cw = (ConnectionWrapper *)(c->user_data);
+            fiber = cw->fiber;
+            Janet out;
+            JanetSignal status = janet_continue(fiber, evdata, &out);
+            if (status != JANET_SIGNAL_OK && status != JANET_SIGNAL_YIELD) {
+                janet_stacktrace(fiber, out);
+                return;
+            }
+            send_http(c, out, p);
             break;
+        }
+        case MG_EV_WEBSOCKET_HANDSHAKE_DONE: {
+            char addr[32];
+            mg_sock_addr_to_str(&c->sa, addr, sizeof(addr),
+                                MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
+            fprintf(stderr, "ws connected %s\n", addr);
+            struct http_message *hm = (struct http_message *)p;
+
+            JanetTable *payload = janet_table(5);
+            janet_table_put(payload, janet_ckeywordv("protocol"), mg2janetstr(hm->proto));
+            janet_table_put(payload, janet_ckeywordv("uri"), mg2janetstr(hm->uri));
+            janet_table_put(payload, janet_ckeywordv("query-string"), janet_cstringv(""));
+            janet_table_put(payload, janet_ckeywordv("connection"), janet_wrap_pointer(c));
+            janet_table_put(payload, janet_ckeywordv("get-clients"), janet_wrap_cfunction(cfun_get_ws_clients));
+            janet_table_put(payload, janet_ckeywordv("event"), janet_ckeywordv("connect"));
+
+            Janet evdata = janet_wrap_table(payload);
+            ConnectionWrapper *cw;
+            JanetFiber *fiber;
+            cw = (ConnectionWrapper *)(c->user_data);
+            fiber = cw->fiber;
+
+            Janet out;
+            JanetSignal status = janet_continue(fiber, evdata, &out);
+            if (status != JANET_SIGNAL_OK && status != JANET_SIGNAL_YIELD) {
+                janet_stacktrace(fiber, out);
+                return;
+            }
+
+            if (!janet_checktype(out, JANET_STRING) && !janet_checktype(out, JANET_BUFFER)) {
+                janet_panicf("websocket data must be a string or buffer, got %d", janet_type(out));
+            }
+
+            const uint8_t *bytes;
+            int32_t len;
+            if (!janet_bytes_view(out, &bytes, &len)) {
+                break;
+            }
+
+            mg_send_websocket_frame(c, WEBSOCKET_OP_TEXT, bytes, len);
+            break;
+        }
+        case MG_EV_WEBSOCKET_FRAME: {
+            struct websocket_message *wm = (struct websocket_message *)p;
+            struct mg_str d = {(char *) wm->data, wm->size};
+
+            JanetTable *payload = janet_table(5);
+            janet_table_put(payload, janet_ckeywordv("protocol"), janet_cstringv("ws"));
+            // FIXME how do i get he correct url in here?
+            janet_table_put(payload, janet_ckeywordv("uri"), janet_cstringv("/ws"));
+            janet_table_put(payload, janet_ckeywordv("query-string"), janet_cstringv(""));
+            janet_table_put(payload, janet_ckeywordv("connection"), janet_wrap_pointer(c));
+            janet_table_put(payload, janet_ckeywordv("get-clients"), janet_wrap_cfunction(cfun_get_ws_clients));
+            janet_table_put(payload, janet_ckeywordv("event"), janet_ckeywordv("frame"));
+            janet_table_put(payload, janet_ckeywordv("data"), mg2janetstr(d));
+
+            Janet evdata = janet_wrap_table(payload);
+            ConnectionWrapper *cw;
+            JanetFiber *fiber;
+            cw = (ConnectionWrapper *)(c->user_data);
+            fiber = cw->fiber;
+
+            Janet out;
+            JanetSignal status = janet_continue(fiber, evdata, &out);
+            if (status != JANET_SIGNAL_OK && status != JANET_SIGNAL_YIELD) {
+                janet_stacktrace(fiber, out);
+                return;
+            }
+            break;
+        }
     }
-    ConnectionWrapper *cw;
-    JanetFiber *fiber;
-    cw = (ConnectionWrapper *)(c->user_data);
-    fiber = cw->fiber;
-    Janet out;
-    JanetSignal status = janet_continue(fiber, evdata, &out);
-    if (status != JANET_SIGNAL_OK && status != JANET_SIGNAL_YIELD) {
-        janet_stacktrace(fiber, out);
-        return;
-    }
-    send_http(c, out, p);
 }
 
 static Janet cfun_manager(int32_t argc, Janet *argv) {
@@ -290,7 +422,7 @@ static void do_bind(int32_t argc, Janet *argv, struct mg_connection **connout,
 
 static Janet cfun_bind_http(int32_t argc, Janet *argv) {
     struct mg_connection *conn = NULL;
-    do_bind(argc, argv, &conn, http_handler);
+    do_bind(argc, argv, &conn, ev_handler);
     mg_set_protocol_http_websocket(conn);
     return argv[0];
 }
