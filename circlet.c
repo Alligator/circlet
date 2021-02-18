@@ -5,6 +5,8 @@
 typedef struct {
     struct mg_connection *conn;
     JanetFiber *fiber;
+    // needed so the router knows where to send websocket frames
+    Janet uri;
 } ConnectionWrapper;
 
 static int connection_mark(void *p, size_t size) {
@@ -241,11 +243,6 @@ static Janet cfun_ws_client_send(int32_t argc, Janet *argv) {
     Janet conn = janet_table_get(self, janet_ckeywordv("connection"));
     struct mg_connection *nc = (struct mg_connection *)janet_unwrap_pointer(conn);
 
-    char addr[32];
-    mg_sock_addr_to_str(&nc->sa, addr, sizeof(addr),
-                        MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
-    fprintf(stderr, "trying to send '%.*s', len %d, to %s\n", len, bytes, len, addr);
-
     mg_send_websocket_frame(nc, WEBSOCKET_OP_TEXT, bytes, len);
     return janet_wrap_nil();
 }
@@ -254,29 +251,13 @@ static Janet cfun_get_ws_clients (int32_t argc, Janet *argv) {
     janet_fixarity(argc, 1);
     JanetTable *req = janet_gettable(argv, 0);
     Janet conn = janet_table_get(req, janet_ckeywordv("connection"));
-    struct mg_connection *nc = (struct mg_connection *)janet_unwrap_pointer(conn);
+    ConnectionWrapper *cw;
+    cw = (ConnectionWrapper *)janet_unwrap_abstract(conn);
 
     JanetArray *clients = janet_array(5);
 
-    char self_addr[32];
-    mg_sock_addr_to_str(&nc->sa, self_addr, sizeof(self_addr),
-                        MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
-
     struct mg_connection *c;
-    for (c = mg_next(nc->mgr, NULL); c != NULL; c = mg_next(nc->mgr, c)) {
-        char addr[32];
-        mg_sock_addr_to_str(&c->sa, addr, sizeof(addr),
-                            MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
-        fprintf(stderr, "get_ws_clients for %s got %s\n", self_addr, addr);
-        if (c == nc) {
-            fprintf(stderr, "  ignoring, same as og\n");
-            continue;
-        }
-        if ((c->flags & MG_F_IS_WEBSOCKET) == 0) {
-            fprintf(stderr, "  ignoring, not websocket\n");
-            continue;
-        }
-
+    for (c = mg_next(cw->conn->mgr, NULL); c != NULL; c = mg_next(cw->conn->mgr, c)) {
         JanetTable *client = janet_table(2);
         janet_table_put(client, janet_ckeywordv("connection"), janet_wrap_pointer(c));
         janet_table_put(client, janet_ckeywordv("send"), janet_wrap_cfunction(cfun_ws_client_send));
@@ -284,6 +265,34 @@ static Janet cfun_get_ws_clients (int32_t argc, Janet *argv) {
     }
 
     return janet_wrap_array(clients);
+}
+
+static Janet build_ws_request(struct mg_connection *c, Janet event, Janet data) {
+    ConnectionWrapper *cw;
+    cw = (ConnectionWrapper *)(c->user_data);
+
+    JanetTable *payload = janet_table(5);
+    janet_table_put(payload, janet_ckeywordv("protocol"), janet_cstringv("ws"));
+    janet_table_put(payload, janet_ckeywordv("uri"), cw->uri);
+    janet_table_put(payload, janet_ckeywordv("query-string"), janet_cstringv(""));
+    janet_table_put(payload, janet_ckeywordv("connection"), janet_wrap_abstract(c->user_data));
+    janet_table_put(payload, janet_ckeywordv("get-clients"), janet_wrap_cfunction(cfun_get_ws_clients));
+    janet_table_put(payload, janet_ckeywordv("event"), event);
+    janet_table_put(payload, janet_ckeywordv("data"), data);
+
+    return janet_wrap_table(payload);
+}
+
+static void resume_connection_fiber(struct mg_connection *c, Janet evdata, Janet *out) {
+    ConnectionWrapper *cw;
+    JanetFiber *fiber;
+    cw = (ConnectionWrapper *)(c->user_data);
+    fiber = cw->fiber;
+    JanetSignal status = janet_continue(fiber, evdata, out);
+    if (status != JANET_SIGNAL_OK && status != JANET_SIGNAL_YIELD) {
+        janet_stacktrace(fiber, *out);
+        return;
+    }
 }
 
 /* The dispatching event handler. This handler is what
@@ -295,50 +304,30 @@ static void ev_handler(struct mg_connection *c, int ev, void *p) {
             return;
         case MG_EV_HTTP_REQUEST: {
             Janet evdata = build_http_request(c, (struct http_message *)p);
-            ConnectionWrapper *cw;
-            JanetFiber *fiber;
-            cw = (ConnectionWrapper *)(c->user_data);
-            fiber = cw->fiber;
             Janet out;
-            JanetSignal status = janet_continue(fiber, evdata, &out);
-            if (status != JANET_SIGNAL_OK && status != JANET_SIGNAL_YIELD) {
-                janet_stacktrace(fiber, out);
-                return;
-            }
+            resume_connection_fiber(c, evdata, &out);
             send_http(c, out, p);
             break;
         }
         case MG_EV_WEBSOCKET_HANDSHAKE_DONE: {
-            char addr[32];
-            mg_sock_addr_to_str(&c->sa, addr, sizeof(addr),
-                                MG_SOCK_STRINGIFY_IP | MG_SOCK_STRINGIFY_PORT);
-            fprintf(stderr, "ws connected %s\n", addr);
             struct http_message *hm = (struct http_message *)p;
 
-            JanetTable *payload = janet_table(5);
-            janet_table_put(payload, janet_ckeywordv("protocol"), mg2janetstr(hm->proto));
-            janet_table_put(payload, janet_ckeywordv("uri"), mg2janetstr(hm->uri));
-            janet_table_put(payload, janet_ckeywordv("query-string"), janet_cstringv(""));
-            janet_table_put(payload, janet_ckeywordv("connection"), janet_wrap_pointer(c));
-            janet_table_put(payload, janet_ckeywordv("get-clients"), janet_wrap_cfunction(cfun_get_ws_clients));
-            janet_table_put(payload, janet_ckeywordv("event"), janet_ckeywordv("connect"));
-
-            Janet evdata = janet_wrap_table(payload);
-            ConnectionWrapper *cw;
+            // get the original connection wrapper and fiber
             JanetFiber *fiber;
-            cw = (ConnectionWrapper *)(c->user_data);
-            fiber = cw->fiber;
+            ConnectionWrapper *og_cw;
+            og_cw = (ConnectionWrapper *)(c->user_data);
+            fiber = og_cw->fiber;
 
+            // create a new one for the new connection + uri
+            ConnectionWrapper *cw = janet_abstract(&Connection_jt, sizeof(ConnectionWrapper));
+            cw->conn = c;
+            cw->fiber = fiber;
+            cw->uri = mg2janetstr(hm->uri);
+            c->user_data = cw;
+
+            Janet evdata = build_ws_request(c, janet_ckeywordv("connect"), janet_wrap_nil());
             Janet out;
-            JanetSignal status = janet_continue(fiber, evdata, &out);
-            if (status != JANET_SIGNAL_OK && status != JANET_SIGNAL_YIELD) {
-                janet_stacktrace(fiber, out);
-                return;
-            }
-
-            if (!janet_checktype(out, JANET_STRING) && !janet_checktype(out, JANET_BUFFER)) {
-                janet_panicf("websocket data must be a string or buffer, got %d", janet_type(out));
-            }
+            resume_connection_fiber(c, evdata, &out);
 
             const uint8_t *bytes;
             int32_t len;
@@ -353,28 +342,9 @@ static void ev_handler(struct mg_connection *c, int ev, void *p) {
             struct websocket_message *wm = (struct websocket_message *)p;
             struct mg_str d = {(char *) wm->data, wm->size};
 
-            JanetTable *payload = janet_table(5);
-            janet_table_put(payload, janet_ckeywordv("protocol"), janet_cstringv("ws"));
-            // FIXME how do i get he correct url in here?
-            janet_table_put(payload, janet_ckeywordv("uri"), janet_cstringv("/ws"));
-            janet_table_put(payload, janet_ckeywordv("query-string"), janet_cstringv(""));
-            janet_table_put(payload, janet_ckeywordv("connection"), janet_wrap_pointer(c));
-            janet_table_put(payload, janet_ckeywordv("get-clients"), janet_wrap_cfunction(cfun_get_ws_clients));
-            janet_table_put(payload, janet_ckeywordv("event"), janet_ckeywordv("frame"));
-            janet_table_put(payload, janet_ckeywordv("data"), mg2janetstr(d));
-
-            Janet evdata = janet_wrap_table(payload);
-            ConnectionWrapper *cw;
-            JanetFiber *fiber;
-            cw = (ConnectionWrapper *)(c->user_data);
-            fiber = cw->fiber;
-
+            Janet evdata = build_ws_request(c, janet_ckeywordv("frame"), mg2janetstr(d));
             Janet out;
-            JanetSignal status = janet_continue(fiber, evdata, &out);
-            if (status != JANET_SIGNAL_OK && status != JANET_SIGNAL_YIELD) {
-                janet_stacktrace(fiber, out);
-                return;
-            }
+            resume_connection_fiber(c, evdata, &out);
             break;
         }
     }
